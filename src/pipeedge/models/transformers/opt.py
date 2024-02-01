@@ -5,15 +5,15 @@ import torch
 from torch import nn
 import logging
 import numpy as np
-from transformers import OPTConfig
+from transformers import OPTConfig, OPTModel
 from collections.abc import Mapping
-from transformers.models.opt.modeling_opt import (
-    OPTDecoder, OPTLearnedPositionalEmbedding, OPTAttention
-)
+from transformers.models.opt.modeling_opt import OPTLearnedPositionalEmbedding
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast
 import os, sys
 from .. import ModuleShard, ModuleShardConfig
+from . import TransformerShardData
 
 class OptLayerShard(ModuleShard):
     """Module shard based on `OPTDecoderLayer`."""
@@ -93,8 +93,9 @@ class OptLayerShard(ModuleShard):
             self.final_layer_norm = nn.LayerNorm(self.config.hidden_size, elementwise_affine=self.config.layer_norm_elementwise_affine)
 
     @torch.no_grad()
-    def forward(self, data, casual_attention_mask):
+    def forward(self, datapack: TransformerShardData) -> TransformerShardData:
         """Compute layer shard."""
+        casual_attention_mask, data = datapack[0], datapack[1]
         if self.has_layer(0):
             self.residual = data
             data = self.k_v_q_proj(data, casual_attention_mask)
@@ -116,7 +117,7 @@ class OptLayerShard(ModuleShard):
             data = self.final_layer_norm(data)
             data = (data,)
             data += (self.present_key_value,)
-        return data
+        return [casual_attention_mask, data]
 
 logger = logging.getLogger(__name__)
 
@@ -188,26 +189,37 @@ class OPTModelShard(ModuleShard):
             self._load_weights_last(weights)
     
     @torch.no_grad()
-    def forward(self, input_ids, attention_mask):
+    # def forward(self, input_ids, attention_mask):
+    def forward(self, data: TransformerShardData) -> TransformerShardData:
         """Compute shard layers."""
         if self.shard_config.is_first:
-            data = self.embed_tokens(input_ids)
-            input_ids_size = input_ids.size()
-            attention_mask = attention_mask
+            input_shape = data.size()
+            input_ids = data.view(-1, input_shape[-1])
+            data = self.embed_tokens(data)
+            batch_size, seq_length = input_shape
+
             past_key_values_length = 0
-            self.casual_attention_mask = OPTDecoder(self.config)._prepare_decoder_attention_mask(attention_mask, input_ids_size, data, past_key_values_length)
+            mask_seq_length = past_key_values_length + seq_length
+            attention_mask = torch.ones(batch_size, mask_seq_length, device=data.device)
+
+            self.casual_attention_mask = _prepare_4d_causal_attention_mask(attention_mask, input_shape, data, past_key_values_length)
+            
+            pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
             data = self.project_in(data)
-            pos_embeds = self.embed_positions(attention_mask)
             data = data + pos_embeds
+        if isinstance(data, tuple):
+            data, self.casual_attention_mask = data[1], data[0]
         for layer in self.layers:
-            layer_outputs = layer(data, self.casual_attention_mask)
+            layer_outputs = layer([self.casual_attention_mask, data])[1]
             data = layer_outputs[0]
             self.next_decoder_cache += (layer_outputs[1],)
         if self.shard_config.is_last:
             data = self.project_out(data)
             next_cache = self.next_decoder_cache
             data = BaseModelOutputWithPast(last_hidden_state=data, past_key_values=next_cache, hidden_states=None, attentions=None)
-        return data
+            data = data['last_hidden_state']
+            return data
+        return (self.casual_attention_mask, data)
 
     @torch.no_grad()
     def _load_weights_layer(self, weights, layer_id, layer):
@@ -232,3 +244,13 @@ class OPTModelShard(ModuleShard):
         if layer.has_layer(3):
             layer.final_layer_norm.weight.copy_(torch.from_numpy(weights[root + "final_layer_norm.weight"]))
             layer.final_layer_norm.bias.copy_(torch.from_numpy(weights[root + "final_layer_norm.bias"]))
+
+    @staticmethod
+    def save_weights(model_name: str, model_file: str) -> None:
+        """Save the model weights file."""
+        model = OPTModel.from_pretrained(model_name)
+        state_dict = model.state_dict()
+        weights = {}
+        for key, val in state_dict.items():
+            weights[key] = val
+        np.savez(model_file, **weights)
