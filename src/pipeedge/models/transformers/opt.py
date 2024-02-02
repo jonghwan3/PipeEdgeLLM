@@ -1,3 +1,4 @@
+# torchvision: 0.16.2, transformers: 4.37.2, Python: 3.8.18
 from collections.abc import Mapping
 import math
 from typing import Union
