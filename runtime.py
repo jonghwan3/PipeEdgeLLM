@@ -250,7 +250,7 @@ def handle_results(tensors: torch.Tensor) -> None:
         # Measure accuracy based on label (microbatch ordering must be enforced for correctness).
         ubatch_labels = label_queue.get()
         assert len(tensors) == len(ubatch_labels)
-        #TODO: in the case of opt model, should be tested by other adequate dataset than CoLA dataset.
+        #TODO: We should create if-else branch here to know if it is for classification task and generation tasks
         if len(tensors.shape) == 3:
             pred = tensors.argmax(dim=1)
             pred = pred.argmax(dim=1)
@@ -374,6 +374,7 @@ def load_dataset(dataset_cfg: dict, model_name: str, batch_size: int, ubatch_siz
     dataset_split = dataset_cfg['split']
     indices = dataset_cfg['indices']
     dataset_shuffle = dataset_cfg['shuffle']
+    #TODO We need to create workflow taking input from keyboard and tokenize the input to LLMs.
     if dataset_name == 'CoLA' or model_name == 'facebook/opt-350m':
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         dataset = data.load_dataset_glue(tokenizer, 'cola', dataset_split, ubatch_size)
