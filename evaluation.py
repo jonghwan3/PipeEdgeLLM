@@ -5,7 +5,8 @@ import time
 import torch
 from typing import List
 from torch.utils.data import DataLoader
-from torchvision.datasets import ImageFolder
+from torchvision.datasets import ImageFolder, ImageNet
+from torchvision import transforms
 from transformers import DeiTFeatureExtractor, ViTFeatureExtractor
 from runtime import forward_hook_quant_encode, forward_pre_hook_quant_decode
 from utils.data import ViTFeatureExtractorTransforms
@@ -37,9 +38,9 @@ class ReportAccuracy():
         with open(file_name, 'a') as f:
             f.write(f"{100*self.total_acc:.2f}\n")
 
-def _make_shard(model_name, model_file, stage_layers, stage, q_bits, prune):
+def _make_shard(model_name, model_file, stage_layers, stage, q_bits):
     shard = model_cfg.module_shard_factory(model_name, model_file, stage_layers[stage][0],
-                                            stage_layers[stage][1], stage, prune)
+                                            stage_layers[stage][1], stage)
     shard.register_buffer('quant_bits', q_bits)
     shard.eval()
     return shard
@@ -66,7 +67,7 @@ def _forward_model(input_tensor, model_shards):
             temp_tensor = (forward_hook_quant_encode(shard, None, temp_tensor),)
     return temp_tensor
 
-def evaluation(args):
+def evaluation(args, dataset_cfg):
     """ Evaluation main func"""
     # localize parameters
     dataset_path = args.dataset_root
@@ -81,9 +82,6 @@ def evaluation(args):
     model_file = args.model_file
     num_stop_batch = args.stop_at_batch
     is_clamp = True
-    prune = args.prune
-    train_batch_size = args.train_batch_size
-    keep_ratio = args.keep_ratio
     # if model_file is None:
     #     model_file = model_cfg.get_model_default_weights_file(model_name)
 
@@ -92,13 +90,26 @@ def evaluation(args):
                         'facebook/deit-small-distilled-patch16-224',
                         'facebook/deit-tiny-distilled-patch16-224']:
         feature_extractor = DeiTFeatureExtractor.from_pretrained(model_name)
+        val_transform = ViTFeatureExtractorTransforms(feature_extractor)
+        val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
+                                transform = val_transform)
+    elif model_name.startswith('torchvision'):
+        feature_extractor = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],std=[0.229, 0.224, 0.225]),
+        # transforms.Lambda(lambda x: x.unsqueeze(0))
+        ])
+        val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
+                                transform = feature_extractor)
     else:
         feature_extractor = ViTFeatureExtractor.from_pretrained(model_name)
-        
+        val_transform = ViTFeatureExtractorTransforms(feature_extractor)
+        val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split),
+                                transform = val_transform)
 
-    val_transform = ViTFeatureExtractorTransforms(feature_extractor)
-    val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split), transform = val_transform)
-    # val_dataset = ImageFolder(dataset_path, transform = val_transform) # on local
+    
     val_loader = DataLoader(
         val_dataset,
         batch_size = batch_size,
@@ -106,36 +117,8 @@ def evaluation(args):
         shuffle=True,
         pin_memory=True
     )
-    if(prune):
-        pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']   
-        if(os.path.isfile(pruned_model_file)):
-            print('Pruned weights file already exists')
-            model_file = pruned_model_file
-        else:
-            # dataset_split = 'train'
-            print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
-            train_dataset = ImageFolder(os.path.join(dataset_path, 'train'), transform = val_transform)
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size = train_batch_size,
-                shuffle=True,
-                pin_memory=True
-            )
-            for ubatch, ubatch_labels in train_loader:
-                config = model_cfg.get_model_config(model_name)
-                shard_config = model_cfg.ModuleShardConfig(layer_start=1, layer_end=model_cfg.get_model_layers(model_name),
-                                                is_first=True, is_last=True)
-                model_file = model_cfg.get_model_default_weights_file(model_name)
-                
-                model = model_cfg._MODEL_CONFIGS[model_name]['shard_module'](config, shard_config, model_file)
-                
-                weights = model.prune_snip(ubatch, ubatch_labels, keep_ratio)
 
-                np.savez(pruned_model_file, **weights)
-                print(pruned_model_file + ' was created successfully')
-                model_file = pruned_model_file
-                break
-
+    # model config
     def _get_default_quant(n_stages: int) -> List[int]:
         return [0] * n_stages
     parts = [int(i) for i in partition.split(',')]
@@ -149,8 +132,9 @@ def evaluation(args):
     q_bits = []
     for stage in range(num_shards):
         q_bits = torch.tensor((0 if stage == 0 else stage_quant[stage - 1], stage_quant[stage]))
-        model_shards.append(_make_shard(model_name, model_file, stage_layers, stage, q_bits, prune))
+        model_shards.append(_make_shard(model_name, model_file, stage_layers, stage, q_bits))
         model_shards[-1].register_buffer('quant_bit', torch.tensor(stage_quant[stage]), persistent=False)
+
 
     # run inference
     start_time = time.time()
@@ -179,17 +163,14 @@ if __name__ == "__main__":
     parser.add_argument("-pt", "--partition", type=str, default= '1,22,23,48',
                         help="comma-delimited list of start/end layer pairs, e.g.: '1,24,25,48'; "
                              "single-node default: all layers in the model")
-    # on local
-    # parser.add_argument("-o", "--output-dir", type=str, default="/Users/namujhp/fogsys/PipeEdge/PipeEdge/results")
-    # parser.add_argument("-o", "--output-dir", type=str, default="/home1/haonanwa/projects/PipeEdge/results")  (PermissionError: [Errno 13] Permission denied: '/home1/haonanwa/projects')
-    parser.add_argument("-o", "--output-dir", type=str, default="/home1/jonghwan/PipeEdge/results")
+    parser.add_argument("-o", "--output-dir", type=str, default="/home1/haonanwa/projects/PipeEdge/results")
     parser.add_argument("-st", "--stop-at-batch", type=int, default=None, help="the # of batch to stop evaluation")
     
     # Device options
     parser.add_argument("-d", "--device", type=str, default=None,
                         help="compute device type to use, with optional ordinal, "
                              "e.g.: 'cpu', 'cuda', 'cuda:1'")
-    parser.add_argument("-n", "--num-workers", default=16, type=int,
+    parser.add_argument("-n", "--num-workers", default=4, type=int,
                         help="the number of worker threads for the dataloder")
     # Model options
     parser.add_argument("-m", "--model-name", type=str, default="google/vit-base-patch16-224",
@@ -199,28 +180,35 @@ if __name__ == "__main__":
                         help="the model file, if not in working directory")
     # Dataset options
     parser.add_argument("-b", "--batch-size", default=64, type=int, help="batch size")
-    parser.add_argument("-tb", "--train-batch-size", default=64, type=int, help="train batch size for pruning")
     parser.add_argument("-u", "--ubatch-size", default=8, type=int, help="microbatch size")
 
     dset = parser.add_argument_group('Dataset arguments')
     dset.add_argument("--dataset-name", type=str, default='ImageNet', choices=['CoLA', 'ImageNet'],
                       help="dataset to use")
-    # dset.add_argument("--dataset-root", type=str, default= "imagenet_validation/", # on local
     dset.add_argument("--dataset-root", type=str, default= "/project/jpwalter_148/hnwang/datasets/ImageNet/",
                       help="dataset root directory (e.g., for 'ImageNet', must contain "
                            "'ILSVRC2012_devkit_t12.tar.gz' and at least one of: "
                            "'ILSVRC2012_img_train.tar', 'ILSVRC2012_img_val.tar'")
-    # dset.add_argument("--dataset-split", default='imagenet_validation', type=str, # on local
     dset.add_argument("--dataset-split", default='val', type=str,
                       help="dataset split (depends on dataset), e.g.: train, val, validation, test")
     dset.add_argument("--dataset-indices-file", default=None, type=str,
                       help="PyTorch or NumPy file with precomputed dataset index sequence")
     dset.add_argument("--dataset-shuffle", type=bool, nargs='?', const=True, default=False,
                       help="dataset shuffle")
-    dset.add_argument("--prune", type=bool, nargs='?', const=True, default=False,
-                      help="Pruning method")
-    dset.add_argument("--keep-ratio", type=float, default=0.9,
-                      help="Snip_pruning keep ratio")
     args = parser.parse_args()
 
-    evaluation(args)
+    if args.dataset_indices_file is None:
+        indices = None
+    elif args.dataset_indices_file.endswith('.pt'):
+        indices = torch.load(args.dataset_indices_file)
+    else:
+        indices = np.load(args.dataset_indices_file)
+    dataset_cfg = {
+        'name': args.dataset_name,
+        'root': args.dataset_root,
+        'split': args.dataset_split,
+        'indices': indices,
+        'shuffle': args.dataset_shuffle,
+    }
+
+    evaluation(args, dataset_cfg)
