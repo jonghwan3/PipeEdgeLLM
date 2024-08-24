@@ -250,11 +250,7 @@ def handle_results(tensors: torch.Tensor) -> None:
         # Measure accuracy based on label (microbatch ordering must be enforced for correctness).
         ubatch_labels = label_queue.get()
         assert len(tensors) == len(ubatch_labels)
-        #TODO: We should create if-else branch here to know if it is for classification task and generation tasks
-        if len(tensors.shape) == 3:
-            pred = tensors.argmax(dim=1)
-            pred = pred.argmax(dim=1)
-        else: pred = tensors.argmax(dim=1)
+        pred = tensors.argmax(dim=1)
         acc = pred.eq(ubatch_labels).sum().item()
     monitoring.iteration(MONITORING_KEY_OUTPUT, work=n_items, accuracy=acc, safe=False)
     logger.info("outputs is %s", tensors)
@@ -374,8 +370,7 @@ def load_dataset(dataset_cfg: dict, model_name: str, batch_size: int, ubatch_siz
     dataset_split = dataset_cfg['split']
     indices = dataset_cfg['indices']
     dataset_shuffle = dataset_cfg['shuffle']
-    #TODO We need to create workflow taking input from keyboard and tokenize the input to LLMs.
-    if dataset_name == 'CoLA' or model_name == 'facebook/opt-350m':
+    if dataset_name == 'CoLA':
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         dataset = data.load_dataset_glue(tokenizer, 'cola', dataset_split, ubatch_size)
         dataset = data.load_dataset_subset(dataset, indices=indices, max_size=batch_size,
@@ -425,7 +420,7 @@ def run_pipeline_p2p(world_size: int, rank: int, model_name: str, model_file: Op
                      quant: Optional[List[int]], rank_order: Optional[List[int]], data_rank: int,
                      hosts: Optional[List[str]], dataset_cfg: dict,
                      sched_models_file: Optional[str], sched_dev_types_file: Optional[str],
-                     sched_dev_file: Optional[str]) -> None:
+                     sched_dev_file: Optional[str], prune: Optional[str]) -> None:
     """Run the pipeline using P2P communication."""
     monitoring.init(MONITORING_KEY_MODEL, get_window_size(), work_type='tensors', acc_type='layers')
     monitoring.add_key(MONITORING_KEY_OUTPUT, work_type='classifications', acc_type='correct')
@@ -464,8 +459,18 @@ def run_pipeline_p2p(world_size: int, rank: int, model_name: str, model_file: Op
         if stage is None:
             model = None
         else:
+            if(prune):
+                pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']    
+                if(os.path.isfile(pruned_model_file)):
+                    print('Will be loaded with pruned weights')
+                    model_file = pruned_model_file
+                    prune_loading = True
+                else:
+                    print('You need pruned weights. Will be downloaded.')
+                    prune_loading = False
+
             model = model_cfg.module_shard_factory(model_name, model_file, stage_layers[stage][0],
-                                                   stage_layers[stage][1], stage)
+                                                   stage_layers[stage][1], stage, prune_loading)
             model.register_buffer('quant_bit', torch.tensor(stage_quant[stage]), persistent=False)
             send_constraint = float(os.getenv(ENV_SEND_CONSTRAINT, str(0)))
             model.register_buffer('rate_constraint', torch.tensor(send_constraint),
@@ -495,6 +500,20 @@ def run_pipeline_p2p(world_size: int, rank: int, model_name: str, model_file: Op
             if rank == data_rank:
                 dataset = load_dataset(dataset_cfg, model_name, batch_size, ubatch_size)
                 data_loader = DataLoader(dataset, batch_size=ubatch_size)
+                if(prune):
+                    pruned_model_file = model_cfg._MODEL_CONFIGS[model_name]['pruned_weights_file']   
+                    if(os.path.isfile(pruned_model_file)):
+                        print('Pruned weights file already exists')
+                        model_file = pruned_model_file
+                    else:
+                        #TO_DO : change data with training
+                        data_loader_snip = DataLoader(dataset, batch_size=64)
+                        for ubatch, ubatch_labels in data_loader_snip:
+                            weights = model.prune_snip(ubatch, ubatch_labels)
+                            np.savez(pruned_model_file, **weights)
+                            print("Completed pruning and download the dataset: Try running again")
+                            return
+                
                 tik_data = time.time()
                 # start results monitoring - see comments in handle_results
                 monitoring.iteration(MONITORING_KEY_OUTPUT, work=0, accuracy=0, safe=False)
@@ -642,6 +661,7 @@ def main() -> None:
     # Input options
     parser.add_argument("-b", "--batch-size", default=64, type=int, help="batch size")
     parser.add_argument("-u", "--ubatch-size", default=8, type=int, help="microbatch size")
+    parser.add_argument("--prune", type=bool, nargs='?', const=True, default=False)
     # Dataset options
     dset = parser.add_argument_group('Dataset arguments')
     dset.add_argument("--dataset-name", type=str, choices=['CoLA', 'ImageNet'],
@@ -725,7 +745,7 @@ def main() -> None:
         run_pipeline_p2p(args.worldsize, args.rank, args.model_name, args.model_file,
                          args.batch_size, args.ubatch_size, partition, quant, rank_order,
                          args.data_rank, hosts, dataset_cfg, args.sched_models_file,
-                         args.sched_dev_types_file, args.sched_dev_file)
+                         args.sched_dev_types_file, args.sched_dev_file, args.prune)
     else:
         run_pipeline_rpc(args.worldsize, args.rank, args.model_name, args.model_file,
                          args.batch_size, args.ubatch_size, partition, quant, rank_order,
