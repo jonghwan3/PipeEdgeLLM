@@ -97,8 +97,8 @@ def evaluation(args):
         
 
     val_transform = ViTFeatureExtractorTransforms(feature_extractor)
-    val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split), transform = val_transform)
-    # val_dataset = ImageFolder(dataset_path, transform = val_transform) # on local
+    # val_dataset = ImageFolder(os.path.join(dataset_path, dataset_split), transform = val_transform)
+    val_dataset = ImageFolder(dataset_path, transform = val_transform) # on local
     val_loader = DataLoader(
         val_dataset,
         batch_size = batch_size,
@@ -114,7 +114,7 @@ def evaluation(args):
         else:
             # dataset_split = 'train'
             print("keep ratio : ", keep_ratio, ",      train_data size : ", train_batch_size)
-            train_dataset = ImageFolder(os.path.join(dataset_path, 'train'), transform = val_transform)
+            train_dataset = ImageFolder(os.path.join(dataset_path, ''), transform = val_transform)
             train_loader = DataLoader(
                 train_dataset,
                 batch_size = train_batch_size,
@@ -180,9 +180,9 @@ if __name__ == "__main__":
                         help="comma-delimited list of start/end layer pairs, e.g.: '1,24,25,48'; "
                              "single-node default: all layers in the model")
     # on local
-    # parser.add_argument("-o", "--output-dir", type=str, default="/Users/namujhp/fogsys/PipeEdge/PipeEdge/results")
+    parser.add_argument("-o", "--output-dir", type=str, default="/Users/namujhp/fogsys/PipeEdge/PipeEdge/results")
     # parser.add_argument("-o", "--output-dir", type=str, default="/home1/haonanwa/projects/PipeEdge/results")  (PermissionError: [Errno 13] Permission denied: '/home1/haonanwa/projects')
-    parser.add_argument("-o", "--output-dir", type=str, default="/home1/jonghwan/PipeEdge/results")
+    # parser.add_argument("-o", "--output-dir", type=str, default="/home1/jonghwan/PipeEdge/results")
     parser.add_argument("-st", "--stop-at-batch", type=int, default=None, help="the # of batch to stop evaluation")
     
     # Device options
@@ -205,13 +205,13 @@ if __name__ == "__main__":
     dset = parser.add_argument_group('Dataset arguments')
     dset.add_argument("--dataset-name", type=str, default='ImageNet', choices=['CoLA', 'ImageNet'],
                       help="dataset to use")
-    # dset.add_argument("--dataset-root", type=str, default= "imagenet_validation/", # on local
-    dset.add_argument("--dataset-root", type=str, default= "/project/jpwalter_148/hnwang/datasets/ImageNet/",
+    dset.add_argument("--dataset-root", type=str, default= "imagenet_validation/", # on local
+    # dset.add_argument("--dataset-root", type=str, default= "/project/jpwalter_148/hnwang/datasets/ImageNet/",
                       help="dataset root directory (e.g., for 'ImageNet', must contain "
                            "'ILSVRC2012_devkit_t12.tar.gz' and at least one of: "
                            "'ILSVRC2012_img_train.tar', 'ILSVRC2012_img_val.tar'")
-    # dset.add_argument("--dataset-split", default='imagenet_validation', type=str, # on local
-    dset.add_argument("--dataset-split", default='val', type=str,
+    dset.add_argument("--dataset-split", default='imagenet_validation', type=str, # on local
+    # dset.add_argument("--dataset-split", default='val', type=str,
                       help="dataset split (depends on dataset), e.g.: train, val, validation, test")
     dset.add_argument("--dataset-indices-file", default=None, type=str,
                       help="PyTorch or NumPy file with precomputed dataset index sequence")
